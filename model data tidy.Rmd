@@ -1,0 +1,441 @@
+---
+title: "SSL_wDPS_model_data_tidy"
+output: html_document
+date: "2026-08-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r packages}
+
+library(here)
+library(dplyr)
+library(lubridate)
+library(reshape2)
+library(Hmisc) 
+library(tidyverse)
+library(readr)
+library(readxl)
+library(fs)
+
+```
+
+```{r unvalidated IDs}
+
+# 1. Set the path to your main umbrella directory
+main_directory <- here('SSL Perinatal Project', 'data')
+
+# 2. Recursively find every .xlsx file in all subfolders
+excel_files <- dir_ls(main_directory, recurse = TRUE, glob = "*.xlsx")
+
+# 3. Read them all and bind them together
+combined_data <- excel_files %>% 
+  # map_df loops through each file path, reads it, and stacks them up.
+  # .id = "source_file" creates a brand-new column containing the file path!
+  map_df(~ read_excel(.x), .id = "source_file") %>% 
+  mutate(date = make_date(year, month, day)) %>%
+  dplyr::rename(AnimalID = animalid, SiteName = sitename, Year = year, Behavior = behavior) %>%
+  dplyr::select(brand, AnimalID, SiteName, Year, date, Behavior)
+
+unread_IDs <- combined_data %>% dplyr::select(brand, AnimalID) %>% distinct() %>% filter(!is.na(AnimalID))
+
+dat <- combined_data %>% 
+  merge(unread_IDs %>% dplyr::rename(ID_missing = AnimalID), by = (c('brand'))) %>%
+  mutate(AnimalID_corr = coalesce(AnimalID, ID_missing)) %>%
+  dplyr::select(-c(ID_missing, AnimalID)) %>%
+  rename(AnimalID = AnimalID_corr)
+
+```
+
+
+
+```{r tidy data}
+
+#branding data
+inits_raw <- read.csv(here::here('SSL Perinatal Project','data', "initial_capture_data_111322.csv"), 
+                  header = T, stringsAsFactors = F) %>%
+  filter(Region %in% c('C ALEU', 'C GULF', 'E ALEU', 'E GULF', 'SE AK', 'W ALEU', 'W GULF')) %>%
+  filter(Region != 'SE AK') %>%
+  dplyr::select(AnimalID, Brand, SiteName, Year, Sex, AdjustedSex, Age, Mass_kg, date, Region)
+
+inits_recent <- read.csv(here::here ('SSL Perinatal Project', 'data', "initial_capture_data_012125.csv"), 
+                  header = T, stringsAsFactors = F) %>%
+  filter(Region %in% c('C ALEU', 'C GULF', 'E ALEU', 'E GULF', 'SE AK', 'W ALEU', 'W GULF')) %>%
+  filter(Region != 'SE AK') %>%
+  dplyr::select(AnimalID, Brand, SiteName, Year, Sex, AdjustedSex, Age, Mass_kg, date, Region)
+
+inits <- bind_rows(inits_raw, inits_recent) %>%
+  transform(Sex = ifelse(!is.na(AdjustedSex), AdjustedSex, Sex)) %>%
+  dplyr::select(AnimalID, Year, Region, SiteName, Sex, Age, 
+                Mass_kg) %>%
+  dplyr::rename(branding_age = Age) %>%
+  transform(Mass_kg = ifelse(is.na(Mass_kg), NA, Mass_kg)) %>% #fill in any NAs (0)
+  filter(SiteName != 'CHISWELL ISLANDS') %>%
+  filter(Sex == 'F')
+
+#resight data
+res_raw <- read.csv(here::here('SSL Perinatal Project', 'data', 'SSL_resights_073025.csv'), 
+                     header = T, stringsAsFactors = F) %>%
+  transform(date = as.Date(date)) %>%
+  transform(year = year(date)) %>%
+  filter(year > 2014)
+
+np_codes <- c('NP', 'NPJ')
+wp_codes <- c('WP', 'WPJ')
+pup_yes <- c(np_codes, wp_codes)
+
+# res_merge <- res_raw %>%
+  
+#parsing fails for rows with a blank 'Time' - doesn't matter
+res_remote <- res_raw %>%
+  # filter(AnimalID == '15907') %>%
+  filter(Age == 'A') %>%
+  dplyr::select(AnimalID, date, Time, Behavior, year) %>%
+  mutate(
+    date = as_date(date),
+    month = month(date, label = TRUE),
+    day = day(date),
+    timestamp = ymd_hms(paste(date, Time, sep = ' '))) %>%
+  dplyr::select(!c(Time, year)) %>%
+  merge(dat, by = c('AnimalID', 'date'), all = T) %>%
+  mutate(Behavior = coalesce(Behavior.x, Behavior.y)) %>%
+  dplyr::select(-c(Behavior.x, Behavior.y)) %>%
+  mutate(pup_y = if_else(Behavior %in% pup_yes, 1, 0)) %>%
+  rename(year = Year) %>%
+  filter(!is.na(AnimalID), !is.na(year)) %>%
+  group_by(AnimalID, year) %>%
+  filter(any(Behavior %in% np_codes, na.rm = TRUE)) %>%
+  ungroup()
+
+min_day <- min(res_remote$timestamp, na.rm = T)
+max_day <- max(res_remote$timestamp, na.rm = T)
+min_year <- min(res_remote$year)
+max_year <- max(res_remote$year)
+
+day_fill <- tibble(
+  date = seq(from = min_day, to = max_day, by = "day")) %>%
+  mutate(year  = year(date),
+    month = month(date, label = TRUE, abbr = TRUE),
+    day   = day(date))
+
+first_pup <- res_remote %>%
+  # rename(year = Year) %>%
+  filter(pup_y == 1) %>%
+  group_by(AnimalID, year) %>%
+  summarise(
+    first_pup_date = min(date, na.rm = TRUE), 
+    .groups = "drop"
+  ) %>%
+  # Convert to a clean date format (dropping hours/minutes)
+  mutate(first_pup = as_date(first_pup_date))
+
+# Get all active females and the years they were seen
+active_females <- res_remote %>%
+  distinct(AnimalID, year)
+
+# Generate a row for every calendar day of the season for every female
+grid <- active_females %>%
+  left_join(day_fill, by = "year", relationship = 'many-to-many') %>%
+  filter(month %in% c('May', 'Jun', 'Jul', 'Aug')) %>%
+  mutate(clean_date = make_date(year, match(month, month.abb), day))
+
+res_complete <- grid %>%
+  left_join(res_remote, by = c("AnimalID", "year", "month", "day")) %>%
+  left_join(first_pup, by = c("AnimalID", "year")) %>%
+  mutate(
+    # If Behavior is NA, she was absent (present = 0), otherwise 1
+    present = if_else(is.na(Behavior), 0, 1),
+    # Populate the date column using our complete, reconstructed date
+    date = clean_date
+  ) %>%
+  dplyr::select(year, month, day, date, AnimalID, present, pup_y, first_pup) %>%
+  # merge(inits %>% dplyr::select(AnimalID, SiteName, Region), by = c('AnimalID'))
+  filter(month %in% c('May', 'Jun', 'Jul', 'Aug'))
+
+#just observations from first_pup to first_pup + 20 for inds in first_pup
+bf <- first_pup$AnimalID
+
+res_pp <- res_complete %>%
+  group_by(year, AnimalID) %>%
+  filter(date >= first_pup, 
+    date <= first_pup + 20) %>%
+  ungroup() %>%
+  filter(AnimalID %in% bf)
+  
+
+##to-do: merge with inits for region/sitename referencing
+#attendance_summary <- res_pp %>%
+  #group_by(AnimalID, year) %>%
+  # Keep only the rows from the birth day onward
+ # filter(
+  #  !is.na(first_pup),
+  #  date >= first_pup
+  #) %>%
+  # Count the daily streak before the first zero absence
+  #summarise(
+  #  first_pup = min(first_pup),
+   # days_before_absence = if_else(
+    #  any(present == 0), 
+    #  match(0, present) - 1, 
+    #  n()
+  #  ),
+  #  .groups = "drop"
+ # ) %>%
+ # merge(inits %>% dplyr::select(AnimalID, SiteName, Region), by = c('AnimalID'), all.x = T) %>%
+  #filter(!is.na(Region)) #get rid of individuals not in "inits"
+
+  attendance_summary <- res_pp %>%
+  group_by(AnimalID, year) %>%
+  filter(!is.na(first_pup), date >= first_pup) %>%
+  summarise(
+    first_pup = min(first_pup),
+    # Streak ends ONLY when 2 consecutive missing days (0, 0) occur
+    days_before_absence = {
+      p <- present
+      two_zeros <- which(p[-length(p)] == 0 & p[-1] == 0)
+      if (length(two_zeros) > 0) {
+        two_zeros[1] - 1
+      } else {
+        length(p)
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  left_join(inits %>% dplyr::select(AnimalID, SiteName, Region), by = 'AnimalID') %>%
+  filter(!is.na(Region))
+  
+##to-do
+### filter(AnimalID %in% pup_yes$AnimalID) #make sure these are just individuals seen with a pup
+plot_dat <- res_pp %>%
+  # filter(AnimalID == '8923') %>%
+  group_by(year, AnimalID) %>%
+  filter(date >= first_pup) %>%
+  merge(inits %>% dplyr::select(AnimalID, SiteName, Region), by = c('AnimalID'), all.x = T) 
+
+#ggplot(plot_dat %>% filter(month %in% c('May', 'Jun', 'Jul')), 
+      # aes(x = date, y = present, color = factor(AnimalID))) +
+  #geom_point() +
+  # geom_line()  +
+  #facet_wrap(~year, scale = 'free') +
+  #theme(legend.position = 'none')
+
+ggplot(
+  plot_dat %>% 
+    filter(
+      month %in% c('May', 'Jun', 'Jul'),
+      AnimalID == 14796  # Filter for AnimalID 14796
+    ), 
+  aes(x = date, y = present, color = factor(AnimalID))
+) +
+  geom_point() +
+  # geom_line() +
+  facet_wrap(
+    ~year, 
+    scales = 'free_x',
+    axes = 'all',         # Draws the y-axis lines & ticks on both facets
+    axis.labels = 'all'   # Draws the 0.00 and 1.00 text labels on both facets
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 1),
+    minor_breaks = c(0.25, 0.5, 0.75),
+    labels = c("0.00", "1.00")
+  ) +
+  labs(
+    x = "Calendar date",
+    y = "Presence on rookery"
+  ) +
+  theme(legend.position = 'none')
+
+#this works, but regional plot pseudo code below will be more interesting once merged with inits
+# ggplot(attendance_summary, aes(x = year, y = days_before_absence, group = year)) +
+#   geom_boxplot() +
+#   xlab('') + ylab('Days before 1st absence') +
+#   theme_bw()
+
+#something like this to show region~year pairings, or maybe we don't care at all about year
+ggplot(attendance_summary, aes(x = Region, y = days_before_absence, group = Region)) +
+  geom_boxplot() +
+  xlab('') + ylab('Days before 1st absence') +
+  facet_grid(~year) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+ggplot(attendance_summary, aes(x = Region, y = days_before_absence, fill = Region)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.5, color = "darkblue") +
+  xlab('Region') + 
+  ylab('Days before 1st absence') +
+  theme_bw()
+  
+# Sample size by Region and Year
+sample_sizes <- attendance_summary %>%
+  group_by(Region, year) %>%
+  summarise(
+    total_observations = n(), 
+    unique_females = n_distinct(AnimalID),
+    .groups = "drop"
+  ) %>%
+  arrange(year, Region)
+
+print(sample_sizes)
+
+#combined C and W plot by year
+ggplot(
+  attendance_summary %>% 
+    mutate(Region = case_when(
+      Region %in% c('C ALEU', 'W ALEU') ~ 'C/W ALEU',
+      TRUE ~ Region
+    )), 
+  aes(x = Region, y = days_before_absence, fill = Region)
+) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.4, color = "darkblue") +
+  labs(x = 'Region', y = 'Days before 1st absence') +
+  facet_grid(~year) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# combined C and W plot overall
+ggplot(
+  attendance_summary %>% 
+    mutate(Region = case_when(
+      Region %in% c('C ALEU', 'W ALEU') ~ 'C/W ALEU',
+      TRUE ~ Region
+    )), 
+  aes(x = Region, y = days_before_absence, fill = Region)
+) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.4, color = "darkblue") +
+  labs(x = 'Region', y = 'Perinatal period length (days)') +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r tidy model data}
+# 1. STANDARDIZE EVENT CODES FOR MULTIEVENT MODEL
+
+# State-based Event Mapping (c):
+# 0 = Not Detected / No Camera Effort in that hour
+# 1 = Detected on land, NO PUP or UNKNOWN/AMBIGUOUS PUP STATUS
+# 2 = Detected on land, Confirmed WITH Pup (NP, NPJ, WP, WPJ)
+
+obs_clean <- res_remote %>%
+  mutate(
+    # Ensure correct POSIXct format for 1-hour binning
+    ts = if ("timestamp" %in% names(.)) {
+      timestamp
+    } else {
+      as.POSIXct(date, tz = "UTC")
+    },
+    
+    # Floor timestamps to 1-hour resolution
+    time_bin = floor_date(ts, unit = "1 hour"),
+    
+    # Hierarchical event assignment for individual photo frames:
+    # Priority: Confirmed Pup (2) > Detected on land with No Pup/Unknown (1)
+    event_code_raw = case_when(
+      Behavior %in% pup_yes ~ 2,
+      TRUE                  ~ 1  # Female detected, but No Pup or Unknown
+    )
+  ) %>%
+  filter(!is.na(time_bin), !is.na(AnimalID))
+
+
+
+# 2. AGGREGATE TO 1-HOUR BINS & IDENTIFY INITIAL BIRTH WINDOWS
+
+obs_1hr <- obs_clean %>%
+  group_by(AnimalID, year, time_bin) %>%
+  summarise(
+    # Pick highest certainty event code if multiple photos occur within the hour
+    # If ANY photo in that hour has a verified pup, code = 2; otherwise code = 1
+    event_code = case_when(
+      any(event_code_raw == 2) ~ 2,
+      TRUE                     ~ 1
+    ),
+    n_photos = n(), # Sampling effort covariate
+    .groups  = "drop"
+  )
+
+# Calculate initial birth timestamp (t0) per female-year
+female_birth_t0 <- obs_1hr %>%
+  filter(event_code == 2) %>%
+  group_by(AnimalID, year) %>%
+  summarise(
+    t0_birth = min(time_bin),
+    .groups  = "drop"
+  )
+
+
+# 3. CONSTRUCT PERINATAL TIME GRID (-48h pre-birth to +22d post-birth)
+
+# Setting the post-birth window to 22 days (576 hours total) ensures all long-fasting females in E ALEU and C/W ALEU are fully captured
+
+grid_perinatal_1hr <- female_birth_t0 %>%
+  group_by(AnimalID, year) %>%
+  reframe(
+    time_bin = seq(
+      from = t0_birth - hours(48),   # 48 hours pre-first pup sighting
+      to   = t0_birth + days(22),     # 22 days post-first pup sighting
+      by   = "1 hour"
+    )
+  ) %>%
+  group_by(AnimalID, year) %>%
+  mutate(hour_step = row_number()) %>%
+  ungroup()
+
+
+# 4. JOIN GRID & BUILD HMM CAPTURE HISTORIES
+
+ch_perinatal_long <- grid_perinatal_1hr %>%
+  left_join(obs_1hr, by = c("AnimalID", "year", "time_bin")) %>%
+  mutate(
+    event_code = replace_na(event_code, 0), # 0 = Not seen / At Sea
+    n_photos   = replace_na(n_photos, 0),   # Camera offline / zero photos
+    ind_year   = paste(AnimalID, year, sep = "_")
+  )
+
+# Extract Format for 'marked' or HMM Likelihood Maximization
+# Long-format character histories (ch)
+ch_marked_format <- ch_perinatal_long %>%
+  group_by(ind_year, AnimalID, year) %>%
+  summarise(
+    ch = paste0(event_code, collapse = ""),
+    .groups = "drop"
+  ) %>%
+  left_join(inits %>% select(AnimalID, Region, SiteName), by = "AnimalID")
+
+# Observation Matrix (Rows = Female-Year, Columns = Hour_1..576)
+y_matrix_perinatal <- ch_perinatal_long %>%
+  select(ind_year, hour_step, event_code) %>%
+  pivot_wider(
+    names_from = hour_step, 
+    names_prefix = "h_", 
+    values_from = event_code
+  ) %>%
+  column_to_rownames("ind_year") %>%
+  as.matrix()
+
+# Effort / Photo Count Matrix (Covariate Matrix)
+effort_matrix_perinatal <- ch_perinatal_long %>%
+  select(ind_year, hour_step, n_photos) %>%
+  pivot_wider(
+    names_from = hour_step, 
+    names_prefix = "h_", 
+    values_from = n_photos
+  ) %>%
+  column_to_rownames("ind_year") %>%
+  as.matrix()
+
+```
+
+```{r}
+
+```
+
