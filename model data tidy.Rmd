@@ -8,8 +8,6 @@ date: "2026-08-27"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-
-
 ```{r packages}
 
 library(here)
@@ -20,6 +18,7 @@ library(Hmisc)
 library(tidyverse)
 library(readr)
 library(readxl)
+library(nimbleEcology)
 library(fs)
 
 ```
@@ -31,6 +30,7 @@ main_directory <- here('SSL Perinatal Project', 'data')
 
 # 2. Recursively find every .xlsx file in all subfolders
 excel_files <- dir_ls(main_directory, recurse = TRUE, glob = "*.xlsx")
+excel_files <- dir_ls(here('data'), recurse = T, glob = '*.xlsx')
 
 # 3. Read them all and bind them together
 combined_data <- excel_files %>% 
@@ -52,17 +52,18 @@ dat <- combined_data %>%
 ```
 
 
-
 ```{r tidy data}
 
 #branding data
-inits_raw <- read.csv(here::here('SSL Perinatal Project','data', "initial_capture_data_111322.csv"), 
+inits_raw <- read.csv(here::here(#'SSL Perinatal Project',
+                                 'data', "initial_capture_data_111322.csv"), 
                   header = T, stringsAsFactors = F) %>%
   filter(Region %in% c('C ALEU', 'C GULF', 'E ALEU', 'E GULF', 'SE AK', 'W ALEU', 'W GULF')) %>%
   filter(Region != 'SE AK') %>%
   dplyr::select(AnimalID, Brand, SiteName, Year, Sex, AdjustedSex, Age, Mass_kg, date, Region)
 
-inits_recent <- read.csv(here::here ('SSL Perinatal Project', 'data', "initial_capture_data_012125.csv"), 
+inits_recent <- read.csv(here::here (#'SSL Perinatal Project', 
+                                     'data', "initial_capture_data_012125.csv"), 
                   header = T, stringsAsFactors = F) %>%
   filter(Region %in% c('C ALEU', 'C GULF', 'E ALEU', 'E GULF', 'SE AK', 'W ALEU', 'W GULF')) %>%
   filter(Region != 'SE AK') %>%
@@ -78,7 +79,8 @@ inits <- bind_rows(inits_raw, inits_recent) %>%
   filter(Sex == 'F')
 
 #resight data
-res_raw <- read.csv(here::here('SSL Perinatal Project', 'data', 'SSL_resights_073025.csv'), 
+res_raw <- read.csv(here::here(#'SSL Perinatal Project', 
+                               'data', 'SSL_resights_073025.csv'), 
                      header = T, stringsAsFactors = F) %>%
   transform(date = as.Date(date)) %>%
   transform(year = year(date)) %>%
@@ -435,7 +437,384 @@ effort_matrix_perinatal <- ch_perinatal_long %>%
 
 ```
 
-```{r}
+```{r mod1 code}
+
+##time-constant p(leave)
+
+library(nimble)
+
+#states:
+## 1: perinatal, on land
+## 2: first foraging trip, at sea
+## 3: on land
+
+hmm_code <- nimbleCode({
+  
+  # -------------------------------------------------
+  # A. PRIORS 
+  # -------------------------------------------------
+  
+  # 1. State Transition Priors
+  for (r in 1:n_regions) {
+    # hourly probability of leaving perinatal state (State 1 -> State 2)
+    # Prior: Beta(1, 150) implies ~ 0.006 probability per hour, 
+    # which roughly centers prior belief at ~7 days (168 hrs) perinatal length.
+    phi_depart[r] ~ dbeta(1, 150) 
+    
+    # Derived quantity: Mean perinatal duration in DAYS
+    mean_peri_days[r] <- (1 / phi_depart[r]) / 24
+  }
+  
+  # hourly probability of returning from 1st trip (State 2 -> State 3)
+  # Beta(1, 50) roughly implies a 2-day first foraging trip
+  phi_return ~ dbeta(1, 50)
+  
+  # Normal post-perinatal cycling (States 3 <-> 4)
+  phi_cycle_depart ~ dbeta(1, 50)
+  phi_cycle_return ~ dbeta(1, 50)
+  
+  # 2. Observation / Detection Priors
+  # Prob of detecting female on land per hour (if she is present)
+  # Beta(7, 3) centers prior at ~70% hourly detection rate
+  p_land ~ dbeta(7, 3) 
+  
+  # Prob of confirming pup IF female is detected
+  # High probability during perinatal (e.g., 80%)
+  r_pup_peri ~ dbeta(8, 2)
+  # Lower probability post-perinatal when pup is older/stashed (e.g., 20%)
+  r_pup_post ~ dbeta(2, 8)
+  
+  # -------------------------------------------------
+  # B. STATE TRANSITION MATRIX (Gamma)
+  # -------------------------------------------------
+  # Dimensions: Gamma[region, current_state, next_state]
+  for (r in 1:n_regions) {
+    # State 1: Perinatal Land -> can stay(1) or depart(2)
+    Gamma[r, 1, 1] <- 1 - phi_depart[r]
+    Gamma[r, 1, 2] <- phi_depart[r]
+    Gamma[r, 1, 3] <- 0
+    Gamma[r, 1, 4] <- 0
+    
+    # State 2: First Foraging Trip (Sea) -> can stay(2) or return(3)
+    Gamma[r, 2, 1] <- 0
+    Gamma[r, 2, 2] <- 1 - phi_return
+    Gamma[r, 2, 3] <- phi_return
+    Gamma[r, 2, 4] <- 0
+    
+    # State 3: Post-trip Land -> can stay(3) or depart(4)
+    Gamma[r, 3, 1] <- 0
+    Gamma[r, 3, 2] <- 0
+    Gamma[r, 3, 3] <- 1 - phi_cycle_depart
+    Gamma[r, 3, 4] <- phi_cycle_depart
+    
+    # State 4: Post-trip Sea -> can stay(4) or return(3)
+    Gamma[r, 4, 1] <- 0
+    Gamma[r, 4, 2] <- 0
+    Gamma[r, 4, 3] <- phi_cycle_return
+    Gamma[r, 4, 4] <- 1 - phi_cycle_return
+  }
+  
+  # -------------------------------------------------
+  # C. OBSERVATION MATRIX (Omega)
+  # -------------------------------------------------
+  # Dimensions: Omega[true_state, observed_state]
+  
+  # State 1: Perinatal Land
+  Omega[1, 1] <- 1 - p_land                    # Not seen
+  Omega[1, 2] <- p_land * (1 - r_pup_peri)     # Seen, no pup
+  Omega[1, 3] <- p_land * r_pup_peri           # Seen, with pup
+  
+  # State 2: First Trip Sea (Cannot be seen)
+  Omega[2, 1] <- 1
+  Omega[2, 2] <- 0
+  Omega[2, 3] <- 0
+  
+  # State 3: Post-trip Land
+  Omega[3, 1] <- 1 - p_land
+  Omega[3, 2] <- p_land * (1 - r_pup_post)
+  Omega[3, 3] <- p_land * r_pup_post
+  
+  # State 4: Post-trip Sea (Cannot be seen)
+  Omega[4, 1] <- 1
+  Omega[4, 2] <- 0
+  Omega[4, 3] <- 0
+
+  # -------------------------------------------------
+  # D. LIKELIHOOD
+  # -------------------------------------------------
+  for (i in 1:N) {
+    # Initialize true state at t0 (which is hour 49 in your matrix)
+    z[i, t0_idx] <- 1 
+    
+    # Model forward from t0+1 to the end of the 22 days
+    for (t in (t0_idx + 1):T_max) {
+      
+      # 1. State process: what state is she in at time t?
+      z[i, t] ~ dcat(Gamma[region[i], z[i, t-1], 1:4])
+      
+      # 2. Observation process: what do we see at time t?
+      y[i, t] ~ dcat(Omega[z[i, t], 1:3])
+    }
+  }
+})
+
+
+#run model
+# 1. Shift observations so 0s become 1s (NIMBLE needs 1, 2, 3)
+y_nimble <- y_matrix_perinatal + 1 
+
+# 2. Extract covariates based on row order of the matrix
+# Ensure the order matches row.names(y_matrix_perinatal)
+covs <- ch_perinatal_long %>%
+  select(ind_year, AnimalID, Region) %>%
+  distinct() %>%
+  arrange(match(ind_year, rownames(y_matrix_perinatal)))
+
+# Convert region to numeric index (e.g., 1 = E ALEU, 2 = C/W ALEU)
+region_idx <- as.numeric(as.factor(covs$Region))
+
+# 3. Create Data and Constants lists
+nimble_consts <- list(
+  N = nrow(y_nimble),
+  T_max = ncol(y_nimble),  # should be 576 + 48 = 624
+  t0_idx = 49,             # hour_step where birth was confirmed
+  n_regions = max(region_idx),
+  region = region_idx
+)
+
+nimble_data <- list(
+  y = y_nimble
+)
+
+# Smart initialization for Z matrix
+z_init <- matrix(NA, nrow = nimble_consts$N, ncol = nimble_consts$T_max)
+for (i in 1:nimble_consts$N) {
+  # Everything after t0 starts in state 1 (Perinatal Land)
+  z_init[i, (nimble_consts$t0_idx + 1):nimble_consts$T_max] <- 1 
+}
+
+nimble_inits <- list(
+  phi_depart = rep(0.005, nimble_consts$n_regions),
+  phi_return = 0.02,
+  phi_cycle_depart = 0.02,
+  phi_cycle_return = 0.02,
+  p_land = 0.7,
+  r_pup_peri = 0.8,
+  r_pup_post = 0.2,
+  z = z_init
+)
+
+# Build, Compile, and Run
+model <- nimbleModel(code = hmm_code, constants = nimble_consts, 
+                     data = nimble_data, inits = nimble_inits)
+cModel <- compileNimble(model)
+conf <- configureMCMC(model, monitors = c("mean_peri_days", "phi_depart", "p_land", "r_pup_peri"))
+mcmc <- buildMCMC(conf)
+cMCMC <- compileNimble(mcmc, project = model)
+
+# Run a quick proof-of-concept chain
+samples <- runMCMC(cMCMC, niter = 5000, nburnin = 1000, thin = 1, samplesAsCodaMCMC = TRUE)
+plot(samples)
+
 
 ```
 
+
+```{r mod2 code}
+
+##time-varying p(leave); hazard function
+
+library(nimble)
+
+#states:
+## 1: perinatal, on land
+## 2: first foraging trip, at sea
+## 3: on land
+
+hmm_code <- nimbleCode({
+  
+  # -------------------------------------------------
+  # A. PRIORS 
+  # -------------------------------------------------
+  
+  # 1. State Transition Priors
+  for (r in 1:n_regions) {
+    # 1. Weibull Shape Parameter (k)
+    # k = 1 is a constant hazard (exponential). 
+    # k > 1 means the probability of leaving INCREASES as time goes on (target departure day).
+    # k < 1 means the probability decreases (highly unlikely for sea lions).
+    shape[r] ~ dunif(1, 10) 
+    
+    # 2. Weibull Scale Parameter (lambda) - in HOURS
+    # This dictates the overall duration. If expected duration is ~7 days, 
+    # the scale will be around 168 hours.
+    scale[r] ~ dunif(1, 1000) 
+    
+    # Derived quantity: Median perinatal duration in DAYS
+    # Median of Weibull = scale * (ln(2))^(1/shape)
+    median_peri_days[r] <- (scale[r] * (log(2))^(1/shape[r])) / 24
+    
+  }
+  
+  # Constant nuisance parameters for states 2, 3, and 4
+  phi_return ~ dbeta(1, 50)
+  phi_cycle_depart <- phi_cycle_depart_fixed  # Passed in as a constant to save MCMC time and recognize that we care less about it
+  phi_cycle_return <- phi_cycle_return_fixed
+  
+  # 2. Observation / Detection Priors
+  # Prob of detecting female on land per hour (if she is present)
+  # Beta(7, 3) centers prior at ~70% hourly detection rate
+  p_land ~ dbeta(7, 3) 
+  
+  # Prob of confirming pup IF female is detected
+  # High probability during perinatal (e.g., 80%)
+  r_pup_peri ~ dbeta(8, 2)
+  # Lower probability post-perinatal when pup is older/stashed (e.g., 20%)
+  r_pup_post ~ dbeta(2, 8)
+  
+  # -------------------------------------------------
+  # B. STATE TRANSITION MATRIX (Gamma)
+  # -------------------------------------------------
+  # Dimensions: Gamma[region, current_state, next_state]
+  for (r in 1:n_regions) {
+    
+    # We only calculate the hazard AFTER birth (t0_idx)
+    for (t in (t0_idx + 1):T_max) {
+      
+      # tau is "hours since birth"
+      tau[t] <- t - t0_idx
+      
+      # Discrete Weibull Hazard: Probability of leaving in this specific hour
+      phi_depart[r, t] <- 1 - exp( ((tau[t] - 1) / scale[r])^shape[r] - 
+                                   (tau[t] / scale[r])^shape[r] )
+      
+      # State 1: Perinatal Land -> can stay(1) or depart(2)
+      Gamma[r, t, 1, 1] <- 1 - phi_depart[r, t]
+      Gamma[r, t, 1, 2] <- phi_depart[r, t]
+      Gamma[r, t, 1, 3] <- 0
+      Gamma[r, t, 1, 4] <- 0
+      
+      # State 2: First Foraging Trip (Sea) -> can stay(2) or return(3)
+      Gamma[r, t, 2, 1] <- 0
+      Gamma[r, t, 2, 2] <- 1 - phi_return
+      Gamma[r, t, 2, 3] <- phi_return
+      Gamma[r, t, 2, 4] <- 0
+      
+      # State 3: Post-trip Land -> can stay(3) or depart(4)
+      Gamma[r, t, 3, 1] <- 0
+      Gamma[r, t, 3, 2] <- 0
+      Gamma[r, t, 3, 3] <- 1 - phi_cycle_depart
+      Gamma[r, t, 3, 4] <- phi_cycle_depart
+      
+      # State 4: Post-trip Sea -> can stay(4) or return(3)
+      Gamma[r, t, 4, 1] <- 0
+      Gamma[r, t, 4, 2] <- 0
+      Gamma[r, t, 4, 3] <- phi_cycle_return
+      Gamma[r, t, 4, 4] <- 1 - phi_cycle_return
+    }
+  }
+  
+  # -------------------------------------------------
+  # C. OBSERVATION MATRIX (Omega)
+  # -------------------------------------------------
+  # Dimensions: Omega[true_state, observed_state]
+  
+  # State 1: Perinatal Land
+  Omega[1, 1] <- 1 - p_land                    # Not seen
+  Omega[1, 2] <- p_land * (1 - r_pup_peri)     # Seen, no pup
+  Omega[1, 3] <- p_land * r_pup_peri           # Seen, with pup
+  
+  # State 2: First Trip Sea (Cannot be seen)
+  Omega[2, 1] <- 1
+  Omega[2, 2] <- 0
+  Omega[2, 3] <- 0
+  
+  # State 3: Post-trip Land
+  Omega[3, 1] <- 1 - p_land
+  Omega[3, 2] <- p_land * (1 - r_pup_post)
+  Omega[3, 3] <- p_land * r_pup_post
+  
+  # State 4: Post-trip Sea (Cannot be seen)
+  Omega[4, 1] <- 1
+  Omega[4, 2] <- 0
+  Omega[4, 3] <- 0
+
+  # -------------------------------------------------
+  # D. LIKELIHOOD
+  # -------------------------------------------------
+  for (i in 1:N) {
+    # Initialize true state at t0 (which is hour 49 in your matrix)
+    z[i, t0_idx] <- 1 
+    
+    # Model forward from t0+1 to the end of the 22 days
+    for (t in (t0_idx + 1):T_max) {
+      
+      # 1. State process: what state is she in at time t?
+      z[i, t] ~ dcat(Gamma[region[i], t, z[i, t-1], 1:4])
+      
+      # 2. Observation process: what do we see at time t?
+      y[i, t] ~ dcat(Omega[z[i, t], 1:3])
+    }
+  }
+})
+
+
+#run model
+# 1. Shift observations so 0s become 1s (NIMBLE needs 1, 2, 3)
+y_nimble <- y_matrix_perinatal + 1 
+
+# 2. Extract covariates based on row order of the matrix
+# Ensure the order matches row.names(y_matrix_perinatal)
+covs <- ch_perinatal_long %>%
+  select(ind_year, AnimalID, Region) %>%
+  distinct() %>%
+  arrange(match(ind_year, rownames(y_matrix_perinatal)))
+
+# Convert region to numeric index (e.g., 1 = E ALEU, 2 = C/W ALEU)
+region_idx <- as.numeric(as.factor(covs$Region))
+
+# 3. Create Data and Constants lists
+nimble_consts <- list(
+  N = nrow(y_nimble),
+  T_max = ncol(y_nimble),  # should be 576 + 48 = 624
+  t0_idx = 49,             # hour_step where birth was confirmed
+  n_regions = max(region_idx),
+  region = region_idx
+)
+
+nimble_data <- list(
+  y = y_nimble
+)
+
+# Smart initialization for Z matrix
+z_init <- matrix(NA, nrow = nimble_consts$N, ncol = nimble_consts$T_max)
+for (i in 1:nimble_consts$N) {
+  # Everything after t0 starts in state 1 (Perinatal Land)
+  z_init[i, (nimble_consts$t0_idx + 1):nimble_consts$T_max] <- 1 
+}
+
+nimble_inits <- list(
+  phi_depart = rep(0.005, nimble_consts$n_regions),
+  phi_return = 0.02,
+  phi_cycle_depart = 0.02,
+  phi_cycle_return = 0.02,
+  p_land = 0.7,
+  r_pup_peri = 0.8,
+  r_pup_post = 0.2,
+  z = z_init
+)
+
+# Build, Compile, and Run
+model <- nimbleModel(code = hmm_code, constants = nimble_consts, 
+                     data = nimble_data, inits = nimble_inits)
+cModel <- compileNimble(model)
+conf <- configureMCMC(model, monitors = c("mean_peri_days", "phi_depart", "p_land", "r_pup_peri"))
+mcmc <- buildMCMC(conf)
+cMCMC <- compileNimble(mcmc, project = model)
+
+# Run a quick proof-of-concept chain
+samples <- runMCMC(cMCMC, niter = 5000, nburnin = 1000, thin = 1, samplesAsCodaMCMC = TRUE)
+plot(samples)
+
+
+```
