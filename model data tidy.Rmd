@@ -18,7 +18,7 @@ library(Hmisc)
 library(tidyverse)
 library(readr)
 library(readxl)
-library(nimbleEcology)
+library(nimble)
 library(fs)
 
 ```
@@ -26,10 +26,10 @@ library(fs)
 ```{r unvalidated IDs}
 
 # 1. Set the path to your main umbrella directory
-main_directory <- here('SSL Perinatal Project', 'data')
+# main_directory <- here('SSL Perinatal Project', 'data')
 
 # 2. Recursively find every .xlsx file in all subfolders
-excel_files <- dir_ls(main_directory, recurse = TRUE, glob = "*.xlsx")
+# excel_files <- dir_ls(main_directory, recurse = TRUE, glob = "*.xlsx")
 excel_files <- dir_ls(here('data'), recurse = T, glob = '*.xlsx')
 
 # 3. Read them all and bind them together
@@ -329,6 +329,7 @@ ggplot(
 
 obs_clean <- res_remote %>%
   mutate(
+    Region = ifelse(grepl('UGAMAK', SiteName), "E ALEU", 'C/W ALEU'),
     # Ensure correct POSIXct format for 1-hour binning
     ts = if ("timestamp" %in% names(.)) {
       timestamp
@@ -353,7 +354,7 @@ obs_clean <- res_remote %>%
 # 2. AGGREGATE TO 1-HOUR BINS & IDENTIFY INITIAL BIRTH WINDOWS
 
 obs_1hr <- obs_clean %>%
-  group_by(AnimalID, year, time_bin) %>%
+  group_by(AnimalID, year, time_bin, Region) %>%
   summarise(
     # Pick highest certainty event code if multiple photos occur within the hour
     # If ANY photo in that hour has a verified pup, code = 2; otherwise code = 1
@@ -368,7 +369,7 @@ obs_1hr <- obs_clean %>%
 # Calculate initial birth timestamp (t0) per female-year
 female_birth_t0 <- obs_1hr %>%
   filter(event_code == 2) %>%
-  group_by(AnimalID, year) %>%
+  group_by(AnimalID, year, Region) %>%
   summarise(
     t0_birth = min(time_bin),
     .groups  = "drop"
@@ -380,7 +381,7 @@ female_birth_t0 <- obs_1hr %>%
 # Setting the post-birth window to 22 days (576 hours total) ensures all long-fasting females in E ALEU and C/W ALEU are fully captured
 
 grid_perinatal_1hr <- female_birth_t0 %>%
-  group_by(AnimalID, year) %>%
+  group_by(AnimalID, year, Region) %>%
   reframe(
     time_bin = seq(
       from = t0_birth - hours(48),   # 48 hours pre-first pup sighting
@@ -388,7 +389,7 @@ grid_perinatal_1hr <- female_birth_t0 %>%
       by   = "1 hour"
     )
   ) %>%
-  group_by(AnimalID, year) %>%
+  group_by(AnimalID, year, Region) %>%
   mutate(hour_step = row_number()) %>%
   ungroup()
 
@@ -396,7 +397,7 @@ grid_perinatal_1hr <- female_birth_t0 %>%
 # 4. JOIN GRID & BUILD HMM CAPTURE HISTORIES
 
 ch_perinatal_long <- grid_perinatal_1hr %>%
-  left_join(obs_1hr, by = c("AnimalID", "year", "time_bin")) %>%
+  left_join(obs_1hr, by = c("AnimalID", "year", "time_bin", 'Region')) %>%
   mutate(
     event_code = replace_na(event_code, 0), # 0 = Not seen / At Sea
     n_photos   = replace_na(n_photos, 0),   # Camera offline / zero photos
@@ -406,12 +407,12 @@ ch_perinatal_long <- grid_perinatal_1hr %>%
 # Extract Format for 'marked' or HMM Likelihood Maximization
 # Long-format character histories (ch)
 ch_marked_format <- ch_perinatal_long %>%
-  group_by(ind_year, AnimalID, year) %>%
+  group_by(ind_year, AnimalID, year, Region) %>%
   summarise(
     ch = paste0(event_code, collapse = ""),
     .groups = "drop"
   ) %>%
-  left_join(inits %>% select(AnimalID, Region, SiteName), by = "AnimalID")
+  left_join(inits %>% select(AnimalID, SiteName), by = "AnimalID")
 
 # Observation Matrix (Rows = Female-Year, Columns = Hour_1..576)
 y_matrix_perinatal <- ch_perinatal_long %>%
@@ -566,7 +567,7 @@ y_nimble <- y_matrix_perinatal + 1
 # 2. Extract covariates based on row order of the matrix
 # Ensure the order matches row.names(y_matrix_perinatal)
 covs <- ch_perinatal_long %>%
-  select(ind_year, AnimalID, Region) %>%
+  dplyr::select(ind_year, AnimalID, Region) %>%
   distinct() %>%
   arrange(match(ind_year, rownames(y_matrix_perinatal)))
 
